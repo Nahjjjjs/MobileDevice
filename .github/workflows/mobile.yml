@@ -1,281 +1,225 @@
+
 name: Mobile device test
 
 on:
-  push:
-    paths-ignore:
-      - CURRENT_ENDPOINT.md
-  pull_request:
-  # Manual runs automatically start the browser-accessible emulator session.
   workflow_dispatch:
     inputs:
       minutes:
-        description: "Maximum interactive session lifetime (1-350 minutes)"
-        required: false
+        description: "How long to keep the cloud Android session alive (1-350 minutes)"
+        required: true
         default: "120"
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
-# Only one mobile test run per branch/PR. New commits cancel stale emulator runs.
 concurrency:
-  # Keep interactive sessions separate from ordinary push/PR checks.
-  group: mobile-device-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: cloud-android-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  android-adb:
-    name: Android emulator and ADB
+  android-emulator:
+    name: Android emulator and browser access
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      # Use a dedicated secret. The prior VNC_PASSWORD secret is a one-character
-      # value, which caused both global log masking and rejected authentication.
       ANDROID_VNC_PASSWORD: ${{ secrets.ANDROID_VNC_PASSWORD }}
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      MINUTES: ${{ inputs.minutes || '120' }}
+
     steps:
-      # Required because SDK setup is maintained in scripts/setup-android-sdk.sh.
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Join private Tailscale network for native scrcpy
-        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
-        uses: tailscale/github-action@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: mobiledevice-${{ github.run_id }}
+          packages: 'platform-tools emulator platforms;android-30 system-images;android-30;google_apis;x86_64'
 
-      - name: Prepare SDK directory for cache restore
+      - name: Validate session settings
+        shell: bash
         run: |
-          sudo chown -R "$(id -un):$(id -gn)" "$ANDROID_HOME"
+          set -euo pipefail
+          if [[ ! "$MINUTES" =~ ^[0-9]+$ ]] || (( MINUTES < 1 || MINUTES > 350 )); then
+            echo "::error::Minutes must be a number from 1 to 350."
+            exit 1
+          fi
+          if [[ -z "${ANDROID_VNC_PASSWORD:-}" ]]; then
+            echo "::error::Add the ANDROID_VNC_PASSWORD secret in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if (( ${#ANDROID_VNC_PASSWORD} < 1 || ${#ANDROID_VNC_PASSWORD} > 8 )); then
+            echo "::error::ANDROID_VNC_PASSWORD must be 1-8 characters because of VNC password limits."
+            exit 1
+          fi
+          echo "Session duration: ${MINUTES} minutes."
 
-      - name: Verify interactive-session secret
+      - name: Enable emulator acceleration when available
+        shell: bash
         run: |
-          echo "Android VNC password source: dedicated secret or built-in six-digit fallback."
-          echo "Set ANDROID_VNC_PASSWORD (1-8 characters) to override the fallback."
-
-      - name: Cache Android SDK and AVD metadata
-        uses: actions/cache@v4
-        with:
-          # Cache only reusable SDK payloads, not the entire SDK installation.
-          # v2 avoids restoring the old monolithic cache.
-          path: |
-            /usr/local/lib/android/sdk/platform-tools
-            /usr/local/lib/android/sdk/emulator
-            /usr/local/lib/android/sdk/platforms
-            /usr/local/lib/android/sdk/system-images
-          key: android-sdk-${{ runner.os }}-api30-v2
-
-      - name: Install Android emulator components
-        run: scripts/setup-android-sdk.sh
-
-      - name: Enable Android emulator hardware acceleration
-        run: |
-          if [ -e /dev/kvm ]; then
+          if [[ -e /dev/kvm ]]; then
             sudo chmod 666 /dev/kvm
-            test -r /dev/kvm && test -w /dev/kvm
-            echo "KVM acceleration available."
+            if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+              echo "KVM acceleration is available."
+            else
+              echo "::warning::KVM is present but unavailable to the runner user."
+            fi
           else
-            echo "::warning::/dev/kvm is unavailable; emulator will be slow."
+            echo "::warning::KVM is not available; Android may boot slowly."
           fi
 
-      - name: Install browser desktop bridge
+      - name: Install browser desktop and tunnel tools
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xvfb x11vnc novnc websockify x11-utils netcat-openbsd socat libpulse0 curl wget
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
-          rm cloudflared-linux-amd64.deb
+            xvfb x11vnc novnc websockify x11-utils netcat-openbsd curl wget ca-certificates
+          wget -q -O cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
 
-      - name: Create and boot emulator
+      - name: Start browser desktop bridge
+        shell: bash
+        env:
+          DISPLAY: ':99'
         run: |
-          set -euxo pipefail
+          set -Eeuo pipefail
+          PASSFILE="$RUNNER_TEMP/vnc.pass"
+          mkdir -p "$HOME/.cache/mobiledevice"
+          Xvfb "$DISPLAY" -screen 0 1280x800x24 -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
+          for i in {1..30}; do
+            xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || {
+            echo "::error::Xvfb did not start."
+            cat xvfb.log || true
+            exit 1
+          }
+          x11vnc -storepasswd "$ANDROID_VNC_PASSWORD" "$PASSFILE" >/dev/null
+          chmod 600 "$PASSFILE"
+          x11vnc -display "$DISPLAY" -localhost -forever -shared -rfbport 5900 \
+            -rfbauth "$PASSFILE" > x11vnc.log 2>&1 &
+          for i in {1..30}; do
+            nc -z 127.0.0.1 5900 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5900 >/dev/null 2>&1 || {
+            echo "::error::x11vnc did not start."
+            cat x11vnc.log || true
+            exit 1
+          }
+          websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 > novnc.log 2>&1 &
+          for i in {1..30}; do
+            curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null || {
+            echo "::error::noVNC did not start."
+            cat novnc.log || true
+            exit 1
+          }
+          echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
+          echo "Browser desktop bridge is ready."
+
+      - name: Create and boot Android 11 emulator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           export ANDROID_AVD_HOME="$HOME/.android/avd"
           mkdir -p "$ANDROID_AVD_HOME"
           echo no | avdmanager create avd \
+            --force \
             --name mobile-test \
             --package 'system-images;android-30;google_apis;x86_64' \
             --device pixel_2
-          "$ANDROID_HOME/emulator/emulator" -list-avds
-
-          export DISPLAY=:99
-          echo 'DISPLAY=:99' >> "$GITHUB_ENV"
-          scripts/start-vnc.sh
-          # Software emulation is slow enough to make Android's System UI ANR.
-          # Prefer the KVM device supplied by GitHub-hosted Ubuntu runners.
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            EMULATOR_ACCEL='-accel on'
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+            ACCEL=(-accel on)
           else
-            EMULATOR_ACCEL='-accel off'
-            echo '::warning::KVM unavailable; Android may take substantially longer to boot.'
+            ACCEL=(-accel off)
           fi
-          # Give the guest enough headroom for System UI and let the emulator select
-          # the best available renderer instead of forcing deprecated SwiftShader mode.
-          EMULATOR_FLAGS="-no-audio -no-boot-anim -no-snapshot -gpu auto -memory 4096 -cores 4 $EMULATOR_ACCEL"
-
-          nohup "$ANDROID_HOME/emulator/emulator" @mobile-test $EMULATOR_FLAGS \
-            > emulator.log 2>&1 &
-          if ! timeout 180 adb wait-for-device; then
-            echo 'Emulator did not connect to ADB within 180 seconds.'
+          nohup "$ANDROID_HOME/emulator/emulator" @mobile-test \
+            -no-audio -no-boot-anim -no-snapshot -gpu auto \
+            -memory 4096 -cores 4 "${ACCEL[@]}" > emulator.log 2>&1 &
+          if ! timeout 240 adb wait-for-device; then
+            echo "::error::The emulator did not connect to ADB within 240 seconds."
             adb devices -l || true
             cat emulator.log || true
             exit 1
           fi
-          timeout 600 bash -c \
-            'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ] && [ "$(adb shell getprop dev.bootcomplete 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 5; done'
-          # Let Android finish rendering its launcher before a browser connects.
-          sleep 15
+          if ! timeout 600 bash -c \
+            'until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do sleep 5; done'; then
+            echo "::error::Android did not finish booting within 10 minutes."
+            adb devices -l || true
+            cat emulator.log || true
+            exit 1
+          fi
+          sleep 10
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
+          echo "Android emulator booted."
 
-      - name: Enable native scrcpy over Tailscale
-        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Publish temporary browser URL
+        shell: bash
         run: |
           set -Eeuo pipefail
-          # scrcpy needs a direct connection to the Android guest. A remote
-          # ADB-server socket lists devices but cannot carry scrcpy's forwarded
-          # video socket back to this computer. Relay the emulator's loopback
-          # ADB port through a Tailscale-only listener instead.
-          adb -s emulator-5554 tcpip 5555
-          TAILSCALE_IP=$(tailscale ip -4)
-          test -n "$TAILSCALE_IP"
-          sudo iptables -I INPUT -i tailscale0 -p tcp --dport 5556 -j ACCEPT || true
-          nohup socat TCP-LISTEN:5556,bind="$TAILSCALE_IP",fork,reuseaddr TCP:127.0.0.1:5555 > socat-adb.log 2>&1 &
-          for i in {1..20}; do
-            adb connect "$TAILSCALE_IP:5556" >/dev/null 2>&1 || true
-            adb devices | grep -q "$TAILSCALE_IP:5556.*device" && break
-            sleep 1
-          done
-          adb devices | grep -q "$TAILSCALE_IP:5556.*device" || {
-            echo '::error::Direct Android ADB relay is not reachable on Tailscale.'
-            ss -lntp || true
-            cat socat-adb.log || true
-            adb devices -l || true
-            exit 1
-          }
-          printf '%s:5556\n' "$TAILSCALE_IP" > scrcpy-adb-endpoint.txt
-          cat > /tmp/current-scrcpy-endpoint.md <<'EOF'
-          # Active Android scrcpy endpoint
-
-          This endpoint is private to your Tailscale tailnet and expires with this workflow.
-
-          ```powershell
-          adb connect __TAILSCALE_IP__:5556
-          scrcpy -s __TAILSCALE_IP__:5556
-          ```
-          EOF
-          sed -i "s/__TAILSCALE_IP__/$TAILSCALE_IP/g" /tmp/current-scrcpy-endpoint.md
-          SHA=$(gh api "repos/${{ github.repository }}/contents/CURRENT_SCRCPY_ENDPOINT.md" --jq .sha 2>/dev/null || true)
-          if [ -n "$SHA" ]; then
-            gh api --method PUT "repos/${{ github.repository }}/contents/CURRENT_SCRCPY_ENDPOINT.md" -f message='chore: update active scrcpy endpoint' -f content="$(base64 -w0 /tmp/current-scrcpy-endpoint.md)" -f sha="$SHA" >/dev/null
-          else
-            gh api --method PUT "repos/${{ github.repository }}/contents/CURRENT_SCRCPY_ENDPOINT.md" -f message='chore: publish active scrcpy endpoint' -f content="$(base64 -w0 /tmp/current-scrcpy-endpoint.md)" >/dev/null
-          fi
-          {
-            echo
-            echo '## Native scrcpy (private Tailscale)'
-            echo
-            echo 'Install Tailscale and scrcpy on your computer, then run:'
-            echo
-            echo "\`adb connect $TAILSCALE_IP:5556\`"
-            echo "\`scrcpy -s $TAILSCALE_IP:5556\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish browser access URL
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MINUTES: ${{ inputs.minutes || '120' }}
-        run: |
-          for i in {1..30}; do
-            curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null && break
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
-          cloudflared tunnel --url http://127.0.0.1:6080 > cloudflared.log 2>&1 &
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 > cloudflared.log 2>&1 &
+          DESKTOP_URL=""
           for i in {1..60}; do
-            DESKTOP_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
-            [ -n "$DESKTOP_URL" ] && break
+            DESKTOP_URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -n 1 || true)"
+            [[ -n "$DESKTOP_URL" ]] && break
             sleep 2
           done
-          [ -n "${DESKTOP_URL:-}" ] || { cat cloudflared.log; exit 1; }
-          ACCESS_URL="$DESKTOP_URL/vnc.html?path=websockify"
-          echo "DESKTOP_URL=$DESKTOP_URL" >> "$GITHUB_ENV"
-          printf '%s\n' "$ACCESS_URL" > emulator-access-url.txt
-          echo "==============================================================="
-          echo "WEB ANDROID DESKTOP: $ACCESS_URL"
-          echo "==============================================================="
-          echo "::notice title=Android emulator URL::$ACCESS_URL"
-
-          # Publish a small, non-secret pointer in the repository, like RDP-AI.
-          # The URL is temporary; it is overwritten on every manual run.
-          printf '# Active Android emulator endpoint\n\n**URL:** %s\n\nThis temporary URL expires when the workflow ends. Login uses the VNC_PASSWORD repository secret.\n' "$ACCESS_URL" > /tmp/current-endpoint.md
-          SHA=$(gh api "repos/${{ github.repository }}/contents/CURRENT_ENDPOINT.md" --jq .sha 2>/dev/null || true)
-          if [ -n "$SHA" ]; then
-            gh api --method PUT "repos/${{ github.repository }}/contents/CURRENT_ENDPOINT.md" \
-              -f message='chore: update active Android emulator endpoint' \
-              -f content="$(base64 -w0 /tmp/current-endpoint.md)" -f sha="$SHA" >/dev/null
-          else
-            gh api --method PUT "repos/${{ github.repository }}/contents/CURRENT_ENDPOINT.md" \
-              -f message='chore: publish active Android emulator endpoint' \
-              -f content="$(base64 -w0 /tmp/current-endpoint.md)" >/dev/null
+          if [[ -z "$DESKTOP_URL" ]]; then
+            echo "::error::Cloudflare did not provide a temporary URL."
+            cat cloudflared.log || true
+            exit 1
           fi
-
+          ACCESS_URL="$DESKTOP_URL/vnc.html?autoconnect=true&resize=scale&path=websockify"
           {
-            echo '# Android emulator browser session'
+            echo "## Android emulator browser session"
             echo
             echo "**Open:** [$ACCESS_URL]($ACCESS_URL)"
             echo
-            echo "The current endpoint is also published in [CURRENT_ENDPOINT.md](https://github.com/${{ github.repository }}/blob/main/CURRENT_ENDPOINT.md)."
+            echo "Enter the password stored in the repository secret ANDROID_VNC_PASSWORD."
             echo
-            echo 'Login uses the VNC_PASSWORD repository secret.'
+            echo "The URL is temporary and works only while this workflow run is active."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "Android emulator URL: $ACCESS_URL"
+          echo "::notice title=Android emulator URL::$ACCESS_URL"
 
-      - name: Upload emulator access details
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-emulator-access
-          path: |
-            emulator-access-url.txt
-            scrcpy-adb-endpoint.txt
-          if-no-files-found: warn
-          retention-days: 1
-
-      - name: Run ADB smoke test
+      - name: Verify emulator
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           adb devices
-          adb -s emulator-5554 shell getprop ro.build.version.release
+          echo "Android version: $(adb -s emulator-5554 shell getprop ro.build.version.release | tr -d '\r')"
           adb -s emulator-5554 shell wm size
-          adb -s emulator-5554 shell settings get secure android_id
 
-      - name: Keep interactive session alive
+      - name: Keep session alive
+        shell: bash
         timeout-minutes: 350
-        env:
-          MINUTES: ${{ inputs.minutes || '120' }}
         run: |
-          DURATION=$(( ${MINUTES:-120} * 60 ))
-          END=$(( $(date +%s) + DURATION ))
-          echo "Interactive Android session is live for ${MINUTES:-120} minutes."
-          while [ "$(date +%s)" -lt "$END" ]; do
+          set -euo pipefail
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          echo "Interactive Android session is available for ${MINUTES} minutes."
+          while (( $(date +%s) < END )); do
             adb -s emulator-5554 get-state >/dev/null
-            echo "Android emulator alive: $(date -u)"
-            sleep 300
+            sleep 60
           done
 
-      - name: Upload emulator logs on failure
+      - name: Upload diagnostic logs if the job fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: android-emulator-logs
           path: |
-            emulator-access-url.txt
             emulator.log
             xvfb.log
             x11vnc.log
             novnc.log
             cloudflared.log
+          if-no-files-found: ignore
+          retention-days: 1
