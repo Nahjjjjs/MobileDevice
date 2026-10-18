@@ -112,7 +112,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           PASSFILE="$RUNNER_TEMP/vnc.pass"
-          Xvfb "$DISPLAY" -screen 0 1280x800x24 -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
+          Xvfb "$DISPLAY" -screen 0 900x1400x24 -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
 
           for i in {1..30}; do
             xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
@@ -155,7 +155,7 @@ jobs:
           echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
           echo "Browser desktop bridge is ready."
 
-      - name: Create and boot low-resolution Android 9 emulator
+      - name: Create and boot Android 9 emulator at a larger resolution
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -183,8 +183,8 @@ jobs:
               printf '%s=%s\n' "$key" "$value" >> "$AVD_CONFIG"
             fi
           }
-          set_avd_config hw.lcd.width 320
-          set_avd_config hw.lcd.height 480
+          set_avd_config hw.lcd.width 720
+          set_avd_config hw.lcd.height 1280
           set_avd_config hw.lcd.depth 16
           set_avd_config hw.lcd.vsync 30
           set_avd_config hw.cpu.ncore 2
@@ -221,8 +221,8 @@ jobs:
             exit 1
           fi
 
-          # Apply the low guest resolution after boot. Do not set wm density.
-          adb shell wm size 320x480
+          # Apply the larger guest resolution after boot. Do not set wm density.
+          adb shell wm size 720x1280
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
@@ -252,7 +252,7 @@ jobs:
             echo
             echo "Enter the password stored in the repository secret ANDROID_VNC_PASSWORD."
             echo
-            echo "Android 9 / API 28; display target 320x480; no custom DPI set; emulator target 30 FPS."
+            echo "Android 9 / API 28; display target 720x1280; no custom DPI set; emulator target 30 FPS."
             echo "Actual performance may be lower depending on runner load and browser/network performance."
             echo
             echo "This URL is temporary and works only while this workflow run is active."
