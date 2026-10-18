@@ -68,7 +68,7 @@ jobs:
             echo "::warning::KVM is unavailable; Android may boot slowly."
           fi
 
-      - name: Install browser desktop, tunnel tools, and emulator runtime libraries
+      - name: Install desktop bridge, scrcpy, and emulator libraries
         timeout-minutes: 12
         shell: bash
         run: |
@@ -82,11 +82,11 @@ jobs:
           echo "Updating Ubuntu package lists..."
           timeout 180s sudo apt-get "${APT_OPTS[@]}" update -y
 
-          echo "Installing VNC, browser, and emulator dependencies..."
+          echo "Installing VNC, scrcpy, and emulator dependencies..."
           timeout 300s sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             xvfb x11vnc novnc websockify x11-utils netcat-openbsd \
-            openbox curl wget ca-certificates libpulse0
+            openbox xdotool wmctrl scrcpy curl wget ca-certificates libpulse0
 
           echo "Downloading Cloudflare Tunnel..."
           timeout 120s wget --tries=2 --timeout=30 -q \
@@ -95,9 +95,10 @@ jobs:
 
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
-          echo "All browser and emulator dependencies installed."
+          scrcpy --version
+          echo "Desktop and emulator dependencies installed."
 
-      - name: Start larger browser desktop bridge (60 FPS polling target)
+      - name: Start browser desktop bridge
         shell: bash
         env:
           DISPLAY: ':99'
@@ -105,8 +106,8 @@ jobs:
           set -Eeuo pipefail
           PASSFILE="$RUNNER_TEMP/vnc.pass"
 
-          # Use a smaller remote desktop so the browser scales the phone less.
-          Xvfb "$DISPLAY" -screen 0 900x900x24 \
+          # Small portrait-oriented canvas leaves less empty space around the phone.
+          Xvfb "$DISPLAY" -screen 0 600x900x24 \
             -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
 
           for i in {1..30}; do
@@ -127,11 +128,10 @@ jobs:
           chmod 600 "$PASSFILE"
 
           # 16 ms polling targets up to about 60 screen polls per second.
-          # Actual FPS depends on the emulator and network performance.
+          # Actual FPS depends on the runner and network connection.
           x11vnc -display "$DISPLAY" -localhost -forever -shared \
             -rfbport 5900 -rfbauth "$PASSFILE" \
-            -wait 16 -wait_ui 1 -defer 5 \
-            > x11vnc.log 2>&1 &
+            -wait 16 -wait_ui 1 -defer 5 > x11vnc.log 2>&1 &
 
           for i in {1..30}; do
             nc -z 127.0.0.1 5900 >/dev/null 2>&1 && break
@@ -161,7 +161,7 @@ jobs:
           echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
           echo "Browser desktop bridge is ready."
 
-      - name: Create and boot larger Android 9 emulator
+      - name: Create and boot Android 9 emulator headlessly
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -180,7 +180,7 @@ jobs:
             exit 1
           fi
 
-          # Change screen size, but do not force custom DPI/density.
+          # Use a portrait phone display; keep Android's default density.
           set_avd_config() {
             local key="$1" value="$2"
             if grep -q "^${key}=" "$AVD_CONFIG"; then
@@ -199,7 +199,7 @@ jobs:
           set_avd_config vm.heapSize 128
           set_avd_config showDeviceFrame no
 
-          echo "AVD configuration:"
+          echo "AVD display configuration:"
           grep -E '^(hw\.lcd\.(width|height|depth|vsync)|hw\.cpu\.ncore|hw\.ramSize|vm\.heapSize|showDeviceFrame)=' "$AVD_CONFIG"
 
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -208,8 +208,9 @@ jobs:
             ACCEL=(-accel off)
           fi
 
+          # Hide the emulator's own GUI; scrcpy will show the phone screen.
           nohup "$ANDROID_HOME/emulator/emulator" @mobile-test \
-            -no-audio -no-boot-anim -no-snapshot -gpu auto \
+            -no-window -no-audio -no-boot-anim -no-snapshot -gpu auto \
             -memory 2048 -cores 2 "${ACCEL[@]}" > emulator.log 2>&1 &
 
           if ! timeout 240 adb wait-for-device; then
@@ -227,15 +228,61 @@ jobs:
             exit 1
           fi
 
-          # Set the guest resolution, leaving density at its device default.
           adb shell wm size 480x800
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
-
           sleep 3
-          echo "Android 9 booted at 480x800 with default density."
-          xwininfo -root -tree || true
+
+          echo "Android 9 booted at 480x800 with default DPI."
+
+      - name: Display phone screen large with scrcpy
+        shell: bash
+        env:
+          DISPLAY: ':99'
+        run: |
+          set -Eeuo pipefail
+
+          # Display only the Android screen, without the emulator toolbar.
+          # This window nearly fills the 600x900 remote desktop.
+          nohup scrcpy \
+            --serial emulator-5554 \
+            --no-audio \
+            --stay-awake \
+            --max-size 800 \
+            --max-fps 60 \
+            --window-title "Android 9 Cloud Phone" \
+            --window-width 520 \
+            --window-height 866 \
+            --window-x 40 \
+            --window-y 10 \
+            --window-borderless \
+            > scrcpy.log 2>&1 &
+
+          SCRCPY_PID=$!
+          WINDOW_ID=""
+
+          for i in {1..45}; do
+            WINDOW_ID="$(xdotool search --onlyvisible --name '^Android 9 Cloud Phone$' 2>/dev/null | head -n 1 || true)"
+            [[ -n "$WINDOW_ID" ]] && break
+
+            if ! kill -0 "$SCRCPY_PID" 2>/dev/null; then
+              echo "::error::scrcpy exited before displaying the phone screen."
+              cat scrcpy.log || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ -z "$WINDOW_ID" ]]; then
+            echo "::error::Could not find the scrcpy phone window."
+            cat scrcpy.log || true
+            wmctrl -lG || true
+            exit 1
+          fi
+
+          wmctrl -i -a "$WINDOW_ID" || true
+          echo "Phone screen displayed using scrcpy. Window ID: $WINDOW_ID"
 
       - name: Publish temporary browser URL
         shell: bash
@@ -266,10 +313,12 @@ jobs:
             echo
             echo "**Open:** [$ACCESS_URL]($ACCESS_URL)"
             echo
-            echo "Enter the password stored in ANDROID_VNC_PASSWORD."
+            echo "Enter the password stored in the ANDROID_VNC_PASSWORD secret."
             echo
-            echo "Android 9 / API 28; 480x800 resolution; default density; 60 Hz target."
-            echo "This URL is temporary and works only while this workflow run is active."
+            echo "Android 9 / API 28; 480x800 resolution; default DPI; scrcpy display; 60 FPS target."
+            echo "Actual frame rate depends on runner resources and network conditions."
+            echo
+            echo "This URL is temporary and works only while the workflow is active."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Android 9 emulator URL: $ACCESS_URL"
@@ -291,11 +340,20 @@ jobs:
         run: |
           set -euo pipefail
           END=$(( $(date +%s) + MINUTES * 60 ))
+          NEXT_LOG=$(( $(date +%s) + 300 ))
+
           echo "Android 9 session is available for ${MINUTES} minutes."
 
           while (( $(date +%s) < END )); do
             adb -s emulator-5554 get-state >/dev/null
-            sleep 60
+            NOW=$(date +%s)
+
+            if (( NOW >= NEXT_LOG )); then
+              echo "Android phone is still running: $(date -u '+%H:%M:%S UTC')"
+              NEXT_LOG=$(( NOW + 300 ))
+            fi
+
+            sleep 30
           done
 
       - name: Upload diagnostic logs if the job fails
@@ -309,6 +367,7 @@ jobs:
             openbox.log
             x11vnc.log
             novnc.log
+            scrcpy.log
             cloudflared.log
           if-no-files-found: ignore
           retention-days: 1
