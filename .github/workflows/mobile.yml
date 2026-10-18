@@ -5,10 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: "Phone model (AVD hardware profile)"
+        description: "Phone model"
         type: choice
         default: pixel_5
         options:
+          # --- Google hardware profiles (real AVD profiles) ---
           - pixel
           - pixel_xl
           - pixel_2
@@ -29,6 +30,38 @@ on:
           - pixel_fold
           - pixel_tablet
           - pixel_c
+          # --- Other brands (screen size + density only) ---
+          - galaxy_s23
+          - galaxy_s21
+          - galaxy_s20_fe
+          - galaxy_a54
+          - galaxy_a34
+          - galaxy_a14
+          - galaxy_a04
+          - galaxy_z_flip
+          - redmi_note_12
+          - redmi_note_11
+          - redmi_9a
+          - poco_f5
+          - poco_x5
+          - oppo_reno8
+          - oppo_a57
+          - vivo_v27
+          - vivo_y20
+          - realme_c55
+          - realme_c11
+          - oneplus_nord
+          - tecno_spark_10
+          - infinix_hot_30
+          - moto_g_power
+          - moto_e13
+          - low_end_720p
+          - mid_1080p
+          - hi_res_1440p
+      apk_url:
+        description: "Optional: direct APK link to install after boot"
+        required: false
+        default: ""
       minutes:
         description: "Session length in minutes (max 330)"
         default: "120"
@@ -45,6 +78,7 @@ jobs:
       VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       SESSION_MINUTES: ${{ inputs.minutes }}
+      APK_URL: ${{ inputs.apk_url }}
 
     steps:
       - name: Require VNC_PASSWORD
@@ -53,6 +87,49 @@ jobs:
             echo "::error::Add a VNC_PASSWORD repository secret first."
             exit 1
           fi
+
+      - name: Resolve device
+        env:
+          CHOICE: ${{ inputs.device }}
+        run: |
+          PROFILE=pixel_5; SIZE=""; DENSITY=""
+          case "$CHOICE" in
+            pixel|pixel_*)   PROFILE="$CHOICE" ;;
+            galaxy_s23)      SIZE=1080x2340; DENSITY=425 ;;
+            galaxy_s21)      SIZE=1080x2400; DENSITY=421 ;;
+            galaxy_s20_fe)   SIZE=1080x2400; DENSITY=407 ;;
+            galaxy_a54)      SIZE=1080x2340; DENSITY=403 ;;
+            galaxy_a34)      SIZE=1080x2340; DENSITY=390 ;;
+            galaxy_a14)      SIZE=1080x2408; DENSITY=400 ;;
+            galaxy_a04)      SIZE=720x1600;  DENSITY=270 ;;
+            galaxy_z_flip)   SIZE=1080x2640; DENSITY=425 ;;
+            redmi_note_12)   SIZE=1080x2400; DENSITY=395 ;;
+            redmi_note_11)   SIZE=1080x2400; DENSITY=409 ;;
+            redmi_9a)        SIZE=720x1600;  DENSITY=270 ;;
+            poco_f5)         SIZE=1080x2400; DENSITY=440 ;;
+            poco_x5)         SIZE=1080x2400; DENSITY=395 ;;
+            oppo_reno8)      SIZE=1080x2412; DENSITY=400 ;;
+            oppo_a57)        SIZE=720x1612;  DENSITY=320 ;;
+            vivo_v27)        SIZE=1080x2400; DENSITY=400 ;;
+            vivo_y20)        SIZE=720x1600;  DENSITY=270 ;;
+            realme_c55)      SIZE=1080x2400; DENSITY=400 ;;
+            realme_c11)      SIZE=720x1600;  DENSITY=270 ;;
+            oneplus_nord)    SIZE=1080x2400; DENSITY=410 ;;
+            tecno_spark_10)  SIZE=720x1612;  DENSITY=320 ;;
+            infinix_hot_30)  SIZE=720x1640;  DENSITY=300 ;;
+            moto_g_power)    SIZE=720x1600;  DENSITY=280 ;;
+            moto_e13)        SIZE=720x1600;  DENSITY=270 ;;
+            low_end_720p)    SIZE=720x1280;  DENSITY=320 ;;
+            mid_1080p)       SIZE=1080x1920; DENSITY=420 ;;
+            hi_res_1440p)    SIZE=1440x2560; DENSITY=560 ;;
+            *) echo "::error::Unknown device $CHOICE"; exit 1 ;;
+          esac
+          {
+            echo "PROFILE=$PROFILE"
+            echo "WM_SIZE=$SIZE"
+            echo "WM_DENSITY=$DENSITY"
+            echo "DEVICE_NAME=$CHOICE"
+          } >> "$GITHUB_ENV"
 
       - name: Enable KVM
         run: |
@@ -99,8 +176,8 @@ jobs:
           adb -s "$SERIAL" wait-for-device
           REL=$(adb -s "$SERIAL" shell getprop ro.build.version.release | tr -d '\r')
           SDK=$(adb -s "$SERIAL" shell getprop ro.build.version.sdk | tr -d '\r')
-          MODEL=$(adb -s "$SERIAL" shell getprop ro.product.model | tr -d '\r')
-          echo "Android $REL (API $SDK) on $MODEL"
+          ABIS=$(adb -s "$SERIAL" shell getprop ro.product.cpu.abilist | tr -d '\r')
+          echo "Android $REL (API $SDK), ABIs: $ABIS"
           if [ "$REL" != "13" ]; then
             echo "::error::Expected Android 13, got $REL"
             exit 1
@@ -108,7 +185,24 @@ jobs:
           adb -s "$SERIAL" shell settings put global stay_on_while_plugged_in 7
           adb -s "$SERIAL" shell input keyevent KEYCODE_WAKEUP
 
-          # 2. size the virtual screen to the chosen model (long edge = 1280)
+          # 2. imitate non-Google models: override screen size + density
+          if [ -n "${WM_SIZE:-}" ]; then
+            adb -s "$SERIAL" shell wm size "$WM_SIZE"
+            adb -s "$SERIAL" shell wm density "$WM_DENSITY"
+            sleep 3
+          fi
+
+          # 3. optional APK install
+          if [ -n "${APK_URL:-}" ]; then
+            echo "Downloading APK"
+            if curl -fsSL -o /tmp/app.apk "$APK_URL"; then
+              adb -s "$SERIAL" install -r -g /tmp/app.apk || echo "::warning::APK install failed"
+            else
+              echo "::warning::APK download failed"
+            fi
+          fi
+
+          # 4. size the virtual screen to the model (long edge = 1280)
           RES=$(adb -s "$SERIAL" shell wm size | grep -o '[0-9]*x[0-9]*' | tail -n1)
           PW=${RES%x*}; PH=${RES#*x}
           MAX=1280
@@ -130,7 +224,7 @@ jobs:
             done
           ) &
 
-          # 3. VNC (password) -> noVNC -> public tunnel
+          # 5. VNC (password) -> noVNC -> public tunnel
           x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vncpass >/dev/null 2>&1
           x11vnc -display :99 -rfbauth /tmp/vncpass -forever -shared -localhost \
                  -rfbport 5900 -quiet -bg -o /tmp/x11vnc.log
@@ -158,14 +252,14 @@ jobs:
           {
             echo "## Android 13 emulator browser session"
             echo
-            echo "Model profile: \`${DEVICE_PROFILE:-unknown}\` (${PW}x${PH})"
+            echo "Model: \`${DEVICE_NAME:-unknown}\` (${PW}x${PH}), ABIs: \`${ABIS}\`"
             echo
             echo "[Open]($FULL)"
             echo
             echo "Password: your \`VNC_PASSWORD\` secret. Session ends in ${MINUTES} min."
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-          # 4. optional: native scrcpy over Tailscale
+          # 6. optional: native scrcpy over Tailscale
           if command -v tailscale >/dev/null 2>&1 && [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
             TS_IP=$(tailscale ip -4 | head -n1)
             socat TCP-LISTEN:5556,fork,reuseaddr,bind="$TS_IP" TCP:127.0.0.1:5555 &
@@ -179,7 +273,7 @@ jobs:
             } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 
-          # 5. hold the session open
+          # 7. hold the session open
           END=$((SECONDS + MINUTES * 60))
           while [ "$SECONDS" -lt "$END" ]; do
             if ! adb -s "$SERIAL" get-state >/dev/null 2>&1; then
@@ -194,16 +288,15 @@ jobs:
 
       - name: Boot Android 13 and serve it
         uses: reactivecircus/android-emulator-runner@v2
-        env:
-          DEVICE_PROFILE: ${{ inputs.device }}
         with:
           api-level: 33
-          target: google_apis
+          target: google_apis_playstore   # Play Store image: includes ARM app translation
           arch: x86_64
-          profile: ${{ inputs.device }}
-          ram-size: 4096M
-          heap-size: 512M
-          disk-size: 8G
+          profile: ${{ env.PROFILE }}
+          cores: 4
+          ram-size: 6144M
+          heap-size: 576M
+          disk-size: 12G
           force-avd-creation: true
           disable-animations: true
           emulator-options: >-
