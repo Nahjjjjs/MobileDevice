@@ -1,31 +1,272 @@
 
-      - name: Install browser tools and emulator runtime libraries
-        timeout-minutes: 8
+name: Mobile device test
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to keep the cloud Android session alive (1-350 minutes)"
+        required: true
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-emulator:
+    name: Android emulator and browser access
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      ANDROID_VNC_PASSWORD: ${{ secrets.ANDROID_VNC_PASSWORD }}
+      MINUTES: ${{ inputs.minutes || '120' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools emulator platforms;android-30 system-images;android-30;google_apis;x86_64'
+
+      - name: Validate session settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$MINUTES" =~ ^[0-9]+$ ]] || (( MINUTES < 1 || MINUTES > 350 )); then
+            echo "::error::Minutes must be between 1 and 350."
+            exit 1
+          fi
+          if [[ -z "${ANDROID_VNC_PASSWORD:-}" ]]; then
+            echo "::error::Add the ANDROID_VNC_PASSWORD repository secret."
+            exit 1
+          fi
+          if (( ${#ANDROID_VNC_PASSWORD} < 1 || ${#ANDROID_VNC_PASSWORD} > 8 )); then
+            echo "::error::VNC password must contain 1-8 characters."
+            exit 1
+          fi
+          echo "Session duration: ${MINUTES} minutes."
+
+      - name: Enable emulator acceleration when available
+        shell: bash
+        run: |
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 666 /dev/kvm
+            if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+              echo "KVM acceleration is available."
+            else
+              echo "::warning::KVM is present but unavailable."
+            fi
+          else
+            echo "::warning::KVM is unavailable; Android may boot slowly."
+          fi
+
+      - name: Install browser desktop, tunnel tools, and emulator runtime libraries
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail
 
           APT_OPTS=(
             -o Acquire::Retries=1
-            -o Acquire::http::Timeout=10
-            -o Acquire::https::Timeout=10
+            -o Acquire::http::Timeout=15
+            -o Acquire::https::Timeout=15
           )
 
-          echo "Updating package lists..."
-          timeout 90s sudo apt-get "${APT_OPTS[@]}" update -y
+          echo "Updating Ubuntu package lists..."
+          timeout 180s sudo apt-get "${APT_OPTS[@]}" update -y
 
-          echo "Installing emulator dependencies..."
-          timeout 180s sudo env DEBIAN_FRONTEND=noninteractive \
+          echo "Installing VNC, browser, and emulator dependencies..."
+          timeout 300s sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             xvfb x11vnc novnc websockify x11-utils \
             netcat-openbsd curl wget ca-certificates libpulse0
 
           echo "Downloading Cloudflare Tunnel..."
-          timeout 90s wget --tries=2 --timeout=20 -q \
+          timeout 120s wget --tries=2 --timeout=30 -q \
             -O cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-          echo "Dependencies installed successfully."
+          echo "All browser and emulator dependencies installed."
+
+      - name: Start browser desktop bridge
+        shell: bash
+        env:
+          DISPLAY: ':99'
+        run: |
+          set -Eeuo pipefail
+          PASSFILE="$RUNNER_TEMP/vnc.pass"
+
+          Xvfb "$DISPLAY" -screen 0 1280x800x24 \
+            -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
+
+          for i in {1..30}; do
+            xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+            echo "::error::Xvfb failed to start."
+            cat xvfb.log || true
+            exit 1
+          fi
+
+          x11vnc -storepasswd "$ANDROID_VNC_PASSWORD" "$PASSFILE" >/dev/null
+          chmod 600 "$PASSFILE"
+
+          x11vnc -display "$DISPLAY" -localhost -forever -shared \
+            -rfbport 5900 -rfbauth "$PASSFILE" > x11vnc.log 2>&1 &
+
+          for i in {1..30}; do
+            nc -z 127.0.0.1 5900 >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          if ! nc -z 127.0.0.1 5900 >/dev/null 2>&1; then
+            echo "::error::VNC failed to start."
+            cat x11vnc.log || true
+            exit 1
+          fi
+
+          websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 \
+            > novnc.log 2>&1 &
+
+          for i in {1..30}; do
+            curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null && break
+            sleep 1
+          done
+
+          if ! curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; then
+            echo "::error::noVNC failed to start."
+            cat novnc.log || true
+            exit 1
+          fi
+
+          echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
+          echo "Browser desktop bridge is ready."
+
+      - name: Create and boot Android 11 emulator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+
+          echo no | avdmanager create avd \
+            --force \
+            --name mobile-test \
+            --package 'system-images;android-30;google_apis;x86_64' \
+            --device pixel_2
+
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+            ACCEL=(-accel on)
+          else
+            ACCEL=(-accel off)
+          fi
+
+          nohup "$ANDROID_HOME/emulator/emulator" @mobile-test \
+            -no-audio -no-boot-anim -no-snapshot -gpu auto \
+            -memory 4096 -cores 4 "${ACCEL[@]}" > emulator.log 2>&1 &
+
+          if ! timeout 240 adb wait-for-device; then
+            echo "::error::Emulator did not connect to ADB within 240 seconds."
+            adb devices -l || true
+            cat emulator.log || true
+            exit 1
+          fi
+
+          if ! timeout 600 bash -c \
+            'until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do sleep 5; done'; then
+            echo "::error::Android did not finish booting within 10 minutes."
+            adb devices -l || true
+            cat emulator.log || true
+            exit 1
+          fi
+
+          sleep 10
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+
+          echo "Android emulator booted."
+
+      - name: Publish temporary browser URL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:6080 > cloudflared.log 2>&1 &
+
+          DESKTOP_URL=""
+          for i in {1..60}; do
+            DESKTOP_URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' \
+              cloudflared.log | head -n 1 || true)"
+            [[ -n "$DESKTOP_URL" ]] && break
+            sleep 2
+          done
+
+          if [[ -z "$DESKTOP_URL" ]]; then
+            echo "::error::Cloudflare did not provide a temporary URL."
+            cat cloudflared.log || true
+            exit 1
+          fi
+
+          ACCESS_URL="$DESKTOP_URL/vnc.html?autoconnect=true&resize=scale&path=websockify"
+
+          {
+            echo "## Android emulator browser session"
+            echo
+            echo "**Open:** [$ACCESS_URL]($ACCESS_URL)"
+            echo
+            echo "Enter the password stored in ANDROID_VNC_PASSWORD."
+            echo
+            echo "This URL expires when the workflow ends."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Android emulator URL: $ACCESS_URL"
+          echo "::notice title=Android emulator URL::$ACCESS_URL"
+
+      - name: Verify emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          adb devices
+          echo "Android version: $(adb -s emulator-5554 shell getprop ro.build.version.release | tr -d '\r')"
+          adb -s emulator-5554 shell wm size
+
+      - name: Keep session alive
+        shell: bash
+        timeout-minutes: 350
+        run: |
+          set -euo pipefail
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          echo "Android session is available for ${MINUTES} minutes."
+
+          while (( $(date +%s) < END )); do
+            adb -s emulator-5554 get-state >/dev/null
+            sleep 60
+          done
+
+      - name: Upload diagnostic logs if the job fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-logs
+          path: |
+            emulator.log
+            xvfb.log
+            x11vnc.log
+            novnc.log
+            cloudflared.log
+          if-no-files-found: ignore
+          retention-days: 1
