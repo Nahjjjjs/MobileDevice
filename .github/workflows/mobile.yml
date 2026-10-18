@@ -4,19 +4,41 @@ name: Mobile device test
 on:
   workflow_dispatch:
     inputs:
+      device:
+        description: "Phone model (AVD hardware profile)"
+        type: choice
+        default: pixel_5
+        options:
+          - pixel
+          - pixel_xl
+          - pixel_2
+          - pixel_2_xl
+          - pixel_3
+          - pixel_3_xl
+          - pixel_3a
+          - pixel_3a_xl
+          - pixel_4
+          - pixel_4_xl
+          - pixel_4a
+          - pixel_5
+          - pixel_6
+          - pixel_6_pro
+          - pixel_6a
+          - pixel_7
+          - pixel_7_pro
+          - pixel_fold
+          - pixel_tablet
+          - pixel_c
       minutes:
         description: "Session length in minutes (max 330)"
         default: "120"
-      device:
-        description: "AVD hardware profile"
-        default: "pixel_5"
 
 permissions:
   contents: read
 
 jobs:
   android13:
-    name: Android 13 emulator (API 33)
+    name: Android 13 (API 33) on ${{ inputs.device }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
@@ -86,12 +108,23 @@ jobs:
           adb -s "$SERIAL" shell settings put global stay_on_while_plugged_in 7
           adb -s "$SERIAL" shell input keyevent KEYCODE_WAKEUP
 
-          # 2. virtual screen + scrcpy mirror (restarts if closed)
-          Xvfb :99 -screen 0 600x1280x24 -nolisten tcp &
+          # 2. size the virtual screen to the chosen model (long edge = 1280)
+          RES=$(adb -s "$SERIAL" shell wm size | grep -o '[0-9]*x[0-9]*' | tail -n1)
+          PW=${RES%x*}; PH=${RES#*x}
+          MAX=1280
+          if [ "$PW" -ge "$PH" ]; then
+            SW=$MAX; SH=$(( PH * MAX / PW ))
+          else
+            SH=$MAX; SW=$(( PW * MAX / PH ))
+          fi
+          SW=$(( SW / 2 * 2 )); SH=$(( SH / 2 * 2 ))
+          echo "Panel ${PW}x${PH} -> display ${SW}x${SH}"
+
+          Xvfb :99 -screen 0 ${SW}x${SH}x24 -nolisten tcp &
           sleep 2
           (
             while true; do
-              scrcpy -s "$SERIAL" --max-size 1280 --window-x 0 --window-y 0 \
+              scrcpy -s "$SERIAL" --max-size "$MAX" --window-x 0 --window-y 0 \
                      --window-borderless --stay-awake >/tmp/scrcpy.log 2>&1
               sleep 2
             done
@@ -124,6 +157,8 @@ jobs:
           echo "::notice title=Android 13 URL::$FULL"
           {
             echo "## Android 13 emulator browser session"
+            echo
+            echo "Model profile: \`${DEVICE_PROFILE:-unknown}\` (${PW}x${PH})"
             echo
             echo "[Open]($FULL)"
             echo
@@ -159,6 +194,8 @@ jobs:
 
       - name: Boot Android 13 and serve it
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          DEVICE_PROFILE: ${{ inputs.device }}
         with:
           api-level: 33
           target: google_apis
