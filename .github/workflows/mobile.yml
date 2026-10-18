@@ -1,8 +1,8 @@
-name: Android 9 cloud phone (API 28)
-run-name: Android 9 cloud phone (${{ inputs.minutes || '10' }} min)
 
-"on":
-  # Allows the Run workflow button in GitHub Actions.
+name: Android 9 cloud phone (API 28)
+run-name: Android 9 cloud phone (${{ inputs.minutes || '120' }} min)
+
+on:
   workflow_dispatch:
     inputs:
       minutes:
@@ -10,14 +10,6 @@ run-name: Android 9 cloud phone (${{ inputs.minutes || '10' }} min)
         required: true
         default: "120"
         type: string
-
-  # Backup: committing this workflow to main starts a short 10-minute test,
-  # even if the manual button is not showing yet.
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/mobile.yml"
 
 permissions:
   contents: read
@@ -33,7 +25,7 @@ jobs:
     timeout-minutes: 350
     env:
       ANDROID_VNC_PASSWORD: ${{ secrets.ANDROID_VNC_PASSWORD }}
-      MINUTES: ${{ github.event_name == 'push' && '10' || inputs.minutes || '120' }}
+      MINUTES: ${{ inputs.minutes || '120' }}
 
     steps:
       - name: Check out repository
@@ -70,7 +62,7 @@ jobs:
             if [[ -r /dev/kvm && -w /dev/kvm ]]; then
               echo "KVM acceleration is available."
             else
-              echo "::warning::KVM is present but unavailable."
+              echo "::warning::KVM is present but unavailable; emulator may be slower."
             fi
           else
             echo "::warning::KVM is unavailable; Android may boot slowly."
@@ -105,19 +97,22 @@ jobs:
           rm -f cloudflared.deb
           echo "All browser and emulator dependencies installed."
 
-      - name: Start browser desktop bridge (about 30 FPS polling)
+      - name: Start browser desktop bridge (60 FPS polling target)
         shell: bash
         env:
           DISPLAY: ':99'
         run: |
           set -Eeuo pipefail
           PASSFILE="$RUNNER_TEMP/vnc.pass"
-          Xvfb "$DISPLAY" -screen 0 900x1400x24 -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
+
+          Xvfb "$DISPLAY" -screen 0 1280x800x24 \
+            -ac +extension GLX +render -noreset > xvfb.log 2>&1 &
 
           for i in {1..30}; do
             xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
             sleep 1
           done
+
           if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
             echo "::error::Xvfb failed to start."
             cat xvfb.log || true
@@ -127,35 +122,42 @@ jobs:
           x11vnc -storepasswd "$ANDROID_VNC_PASSWORD" "$PASSFILE" >/dev/null
           chmod 600 "$PASSFILE"
 
-          # A 33 ms framebuffer polling interval aims for about 30 screen updates per second.
+          # 16 ms polling targets up to roughly 60 screen polls per second.
+          # Actual frame rate depends on the host, emulator, and browser connection.
           x11vnc -display "$DISPLAY" -localhost -forever -shared \
-            -rfbport 5900 -rfbauth "$PASSFILE" -wait 33 -wait_ui 1 -defer 10 \
+            -rfbport 5900 -rfbauth "$PASSFILE" \
+            -wait 16 -wait_ui 1 -defer 5 -nowait_bog \
             > x11vnc.log 2>&1 &
 
           for i in {1..30}; do
             nc -z 127.0.0.1 5900 >/dev/null 2>&1 && break
             sleep 1
           done
+
           if ! nc -z 127.0.0.1 5900 >/dev/null 2>&1; then
             echo "::error::VNC failed to start."
             cat x11vnc.log || true
             exit 1
           fi
 
-          websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 > novnc.log 2>&1 &
+          websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 \
+            > novnc.log 2>&1 &
+
           for i in {1..30}; do
             curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null && break
             sleep 1
           done
+
           if ! curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; then
             echo "::error::noVNC failed to start."
             cat novnc.log || true
             exit 1
           fi
+
           echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
           echo "Browser desktop bridge is ready."
 
-      - name: Create and boot Android 9 emulator at a larger resolution
+      - name: Create and boot low-resolution Android 9 emulator at 60 Hz
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -169,12 +171,13 @@ jobs:
             --device pixel_2
 
           AVD_CONFIG="$ANDROID_AVD_HOME/mobile-test.avd/config.ini"
+
           if [[ ! -f "$AVD_CONFIG" ]]; then
             echo "::error::Could not find AVD config at $AVD_CONFIG"
             exit 1
           fi
 
-          # Modify screen resolution only. No custom DPI/density is applied.
+          # Change resolution and refresh target, not density.
           set_avd_config() {
             local key="$1" value="$2"
             if grep -q "^${key}=" "$AVD_CONFIG"; then
@@ -183,10 +186,11 @@ jobs:
               printf '%s=%s\n' "$key" "$value" >> "$AVD_CONFIG"
             fi
           }
-          set_avd_config hw.lcd.width 720
-          set_avd_config hw.lcd.height 1280
+
+          set_avd_config hw.lcd.width 320
+          set_avd_config hw.lcd.height 480
           set_avd_config hw.lcd.depth 16
-          set_avd_config hw.lcd.vsync 30
+          set_avd_config hw.lcd.vsync 60
           set_avd_config hw.cpu.ncore 2
           set_avd_config hw.ramSize 2048
           set_avd_config vm.heapSize 128
@@ -198,7 +202,6 @@ jobs:
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then
             ACCEL=(-accel on)
           else
-            export ANDROID_I_WANT_MY_TCG=yes
             ACCEL=(-accel off)
           fi
 
@@ -221,30 +224,38 @@ jobs:
             exit 1
           fi
 
-          # Apply the larger guest resolution after boot. Do not set wm density.
-          adb shell wm size 720x1280
+          # Apply the low guest resolution. Leave density at its default.
+          adb shell wm size 320x480
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
-          echo "Android 9 emulator booted. Custom DPI has not been set."
+
+          echo "Android 9 booted at 320x480, with default DPI and 60 Hz target."
 
       - name: Publish temporary browser URL
         shell: bash
         run: |
           set -Eeuo pipefail
-          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 > cloudflared.log 2>&1 &
+
+          cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:6080 > cloudflared.log 2>&1 &
+
           DESKTOP_URL=""
           for i in {1..60}; do
-            DESKTOP_URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -n 1 || true)"
+            DESKTOP_URL="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' \
+              cloudflared.log | head -n 1 || true)"
             [[ -n "$DESKTOP_URL" ]] && break
             sleep 2
           done
+
           if [[ -z "$DESKTOP_URL" ]]; then
             echo "::error::Cloudflare did not provide a temporary URL."
             cat cloudflared.log || true
             exit 1
           fi
+
           ACCESS_URL="$DESKTOP_URL/vnc.html?autoconnect=true&resize=scale&path=websockify"
+
           {
             echo "## Android 9 emulator browser session"
             echo
@@ -252,11 +263,12 @@ jobs:
             echo
             echo "Enter the password stored in the repository secret ANDROID_VNC_PASSWORD."
             echo
-            echo "Android 9 / API 28; display target 720x1280; no custom DPI set; emulator target 30 FPS."
-            echo "Actual performance may be lower depending on runner load and browser/network performance."
+            echo "Android 9 / API 28; 320x480 resolution; default DPI; 60 Hz refresh target."
+            echo "Screen polling targets about 60 polls per second, but actual FPS may be lower."
             echo
             echo "This URL is temporary and works only while this workflow run is active."
           } >> "$GITHUB_STEP_SUMMARY"
+
           echo "Android 9 emulator URL: $ACCESS_URL"
           echo "::notice title=Android 9 emulator URL::$ACCESS_URL"
 
@@ -277,6 +289,7 @@ jobs:
           set -euo pipefail
           END=$(( $(date +%s) + MINUTES * 60 ))
           echo "Android 9 session is available for ${MINUTES} minutes."
+
           while (( $(date +%s) < END )); do
             adb -s emulator-5554 get-state >/dev/null
             sleep 60
