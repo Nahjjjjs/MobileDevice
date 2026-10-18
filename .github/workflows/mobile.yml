@@ -68,7 +68,7 @@ jobs:
             echo "::warning::KVM is unavailable; Android may boot slowly."
           fi
 
-      - name: Install browser desktop, tunnel tools, and emulator runtime libraries
+      - name: Install browser desktop, window management, tunnel, and emulator libraries
         timeout-minutes: 12
         shell: bash
         run: |
@@ -82,11 +82,11 @@ jobs:
           echo "Updating Ubuntu package lists..."
           timeout 180s sudo apt-get "${APT_OPTS[@]}" update -y
 
-          echo "Installing VNC, browser, and emulator dependencies..."
+          echo "Installing browser, window sizing, and emulator dependencies..."
           timeout 300s sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             xvfb x11vnc novnc websockify x11-utils netcat-openbsd \
-            curl wget ca-certificates libpulse0
+            xdotool wmctrl openbox curl wget ca-certificates libpulse0
 
           echo "Downloading Cloudflare Tunnel..."
           timeout 120s wget --tries=2 --timeout=30 -q \
@@ -119,11 +119,23 @@ jobs:
             exit 1
           fi
 
+          # Start a window manager so the emulator can be maximized.
+          openbox --sm-disable > openbox.log 2>&1 &
+
+          for i in {1..20}; do
+            wmctrl -m >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          if ! wmctrl -m >/dev/null 2>&1; then
+            echo "::warning::Openbox did not start; continuing without window management."
+          fi
+
           x11vnc -storepasswd "$ANDROID_VNC_PASSWORD" "$PASSFILE" >/dev/null
           chmod 600 "$PASSFILE"
 
-          # 16 ms polling targets up to roughly 60 screen polls per second.
-          # Actual frame rate depends on the host, emulator, and browser connection.
+          # 16 ms polling targets about 60 screen polls per second.
+          # Actual FPS depends on emulator and network performance.
           x11vnc -display "$DISPLAY" -localhost -forever -shared \
             -rfbport 5900 -rfbauth "$PASSFILE" \
             -wait 16 -wait_ui 1 -defer 5 -nowait_bog \
@@ -177,7 +189,7 @@ jobs:
             exit 1
           fi
 
-          # Change resolution and refresh target, not density.
+          # Keep the low-resolution screen. Do not force a custom DPI.
           set_avd_config() {
             local key="$1" value="$2"
             if grep -q "^${key}=" "$AVD_CONFIG"; then
@@ -208,6 +220,7 @@ jobs:
           nohup "$ANDROID_HOME/emulator/emulator" @mobile-test \
             -no-audio -no-boot-anim -no-snapshot -gpu auto \
             -memory 2048 -cores 2 "${ACCEL[@]}" > emulator.log 2>&1 &
+          EMULATOR_PID=$!
 
           if ! timeout 240 adb wait-for-device; then
             echo "::error::Android 9 emulator did not connect to ADB within 240 seconds."
@@ -224,13 +237,40 @@ jobs:
             exit 1
           fi
 
-          # Apply the low guest resolution. Leave density at its default.
           adb shell wm size 320x480
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
 
-          echo "Android 9 booted at 320x480, with default DPI and 60 Hz target."
+          echo "Android 9 booted at 320x480 with default DPI."
+
+          # Find the emulator GUI window and maximize it in the remote desktop.
+          WINDOW_ID=""
+          for i in {1..60}; do
+            WINDOW_ID="$(xdotool search --onlyvisible --name 'Android Emulator' 2>/dev/null | head -n 1 || true)"
+
+            if [[ -z "$WINDOW_ID" ]]; then
+              WINDOW_ID="$(xdotool search --onlyvisible --name 'mobile-test' 2>/dev/null | head -n 1 || true)"
+            fi
+
+            if [[ -z "$WINDOW_ID" ]]; then
+              WINDOW_ID="$(wmctrl -lp 2>/dev/null | awk -v pid="$EMULATOR_PID" '$3 == pid {print $1; exit}')"
+            fi
+
+            [[ -n "$WINDOW_ID" ]] && break
+            sleep 1
+          done
+
+          if [[ -n "$WINDOW_ID" ]]; then
+            wmctrl -i -a "$WINDOW_ID" || true
+            wmctrl -i -r "$WINDOW_ID" -b add,maximized_vert,maximized_horz || true
+            sleep 2
+            echo "Emulator GUI window maximized. Window ID: $WINDOW_ID"
+            wmctrl -lG || true
+          else
+            echo "::warning::Could not locate the emulator GUI window automatically."
+            wmctrl -lG || true
+          fi
 
       - name: Publish temporary browser URL
         shell: bash
@@ -261,12 +301,13 @@ jobs:
             echo
             echo "**Open:** [$ACCESS_URL]($ACCESS_URL)"
             echo
-            echo "Enter the password stored in the repository secret ANDROID_VNC_PASSWORD."
+            echo "Enter the password stored in ANDROID_VNC_PASSWORD."
             echo
-            echo "Android 9 / API 28; 320x480 resolution; default DPI; 60 Hz refresh target."
-            echo "Screen polling targets about 60 polls per second, but actual FPS may be lower."
+            echo "Android 9 / API 28; 320x480; default DPI; 60 Hz target."
+            echo "The emulator window is maximized in the remote desktop."
+            echo "Actual FPS depends on emulator performance and network conditions."
             echo
-            echo "This URL is temporary and works only while this workflow run is active."
+            echo "This URL is temporary and works only while this workflow is active."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Android 9 emulator URL: $ACCESS_URL"
@@ -303,6 +344,7 @@ jobs:
           path: |
             emulator.log
             xvfb.log
+            openbox.log
             x11vnc.log
             novnc.log
             cloudflared.log
